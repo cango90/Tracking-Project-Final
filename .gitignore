@@ -1,0 +1,22 @@
+# Ignoriere alle Videodateien und große Ausgaben
+*.mp4
+*.avi
+*.mov
+
+# Ignoriere temporäre/ausgegebene Dateien
+tracked_output.mp4
+final_tracked_output.mp4
+combined_tracked_output.mp4
+ego_centric_tracked_output.mp4
+echo "# Tracking-Project-WS25" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remo\Ùte add origin https://github.com/cango90/Tracking-Project-WS25.git
+git push -u origin main
+^X
+	% ^X
+		
+^X
+	

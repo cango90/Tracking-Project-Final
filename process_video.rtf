@@ -1,0 +1,276 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\froman\fcharset0 Times-Roman;}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;}
+{\*\expandedcolortbl;;\cssrgb\c0\c0\c0;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\deftab720
+\pard\pardeftab720\partightenfactor0
+
+\f0\fs24 \cf0 \expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 import cv2\
+import numpy as np\
+import math\
+\
+# ==============================================================================\
+# 1. KONSTANTEN & WELT-DEFINITIONEN\
+# ==============================================================================\
+\
+# A. Marker-Spezifikationen\
+VIDEO_FILE = '/Users/berk-cancelebi/Documents/Dolgov-Software_Engineering/ArUco_Projekt/VID_20251008_083345.mp4'\
+OUTPUT_FILE = '/Users/berk-cancelebi/Documents/Dolgov-Software_Engineering/ArUco_Projekt/final_tracked_output.mp4'\
+MARKER_SIDE_LENGTH = 12.0               \
+DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)\
+\
+# B. Kamerakalibrierungsparameter (PLATZHALTER!)\
+cameraMatrix = np.array([\
+    [700.0, 0.0, 640.0],\
+    [0.0, 700.0, 480.0],\
+    [0.0, 0.0, 1.0]\
+])\
+distCoeffs = np.array([0.0, 0.0, 0.0, 0.0, 0.0])\
+\
+\
+# C. Die Feste Welt-Definition (IDs und GESCH\'c4TZTE Positionen)\
+ID_A = 2  # Ursprung (Marker 2)\
+ID_B = 0\
+ID_C = 1\
+\
+POS_A = np.array([0.0, 0.0, 0.0])      \
+POS_B = np.array([-45.0, 30.0, 0.0])   \
+POS_C = np.array([45.0, 50.0, 0.0])     \
+\
+marker_data = \{\
+    ID_A: POS_A,\
+    ID_B: POS_B,\
+    ID_C: POS_C\
+\}\
+\
+half_side = MARKER_SIDE_LENGTH / 2.0\
+BASE_CORNERS = np.array([\
+    [-half_side, half_side, 0.0],\
+    [ half_side, half_side, 0.0],\
+    [ half_side,-half_side, 0.0],\
+    [-half_side,-half_side, 0.0]\
+], dtype=np.float32)\
+\
+# GLOBALE VARIABLE zur Speicherung des Bewegungspfades\
+CAMERA_PATH = []\
+SMOOTHING_ALPHA = 0.90 \
+H_smooth = None        \
+\
+\
+# ==============================================================================\
+# 2. HILFSFUNKTIONEN\
+# ==============================================================================\
+\
+def get_obj_and_img_points(corners, ids, marker_data, base_corners):\
+    """Sammelt alle 3D-Weltpunkte und ihre 2D-Bildpunkte f\'fcr solvePnP."""\
+    obj_points = []\
+    img_points = []\
+    \
+    if ids is None:\
+        return np.array([]), np.array([])\
+\
+    for i in range(len(ids)):\
+        marker_id = ids[i][0] if isinstance(ids[i], np.ndarray) else ids[i] \
+        \
+        if marker_id in marker_data:\
+            marker_pos = marker_data[marker_id]\
+            world_corners = base_corners + marker_pos\
+            image_corners = corners[i][0]\
+            \
+            obj_points.extend(world_corners)\
+            img_points.extend(image_corners)\
+\
+    return np.array(obj_points, dtype=np.float32), np.array(img_points, dtype=np.float32)\
+\
+def pose_to_matrix(rvec, tvec):\
+    """Konvertiert rvec und tvec in eine 4x4 Homogene Transformationsmatrix (World_T_Camera)."""\
+    R, _ = cv2.Rodrigues(rvec)\
+    H = np.eye(4, dtype=np.float64)\
+    H[:3, :3] = R\
+    H[:3, 3] = tvec.flatten()\
+    return H\
+\
+def get_axis_points(marker_side_length):\
+    """Definiert die 3D-Punkte f\'fcr die Achsen, verschoben an die Ecke."""\
+    axis_length = marker_side_length / 2.0\
+    offset = marker_side_length / 2.0 \
+    \
+    # Die Achsen beginnen an der unteren linken Ecke des Markers\
+    axis_points_3d = np.float32([\
+        [-offset, -offset, 0],          # Ursprung (Untere linke Ecke)\
+        [-offset + axis_length, -offset, 0],  # X-Achse (Rot)\
+        [-offset, -offset + axis_length, 0],  # Y-Achse (Gr\'fcn)\
+        [-offset, -offset, -axis_length]      # Z-Achse (Blau, zeigt in den Boden)\
+    ])\
+    return axis_points_3d\
+\
+# ==============================================================================\
+# 3. VIDEO-VERARBEITUNG mit FUSION\
+# ==============================================================================\
+\
+def process_video():\
+    global H_smooth \
+    cap = cv2.VideoCapture(VIDEO_FILE)\
+    parameters = cv2.aruco.DetectorParameters() \
+\
+    if not cap.isOpened():\
+        print(f"FEHLER: Konnte Videodatei '\{VIDEO_FILE\}' nicht \'f6ffnen.")\
+        return\
+        \
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))\
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))\
+    fps = cap.get(cv2.CAP_PROP_FPS)\
+\
+    MAP_HEIGHT = frame_height // 2 \
+    output_width = frame_width\
+    output_height = frame_height + MAP_HEIGHT \
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')\
+    out = cv2.VideoWriter(OUTPUT_FILE, fourcc, fps, (output_width, output_height))\
+    \
+    print(f"Starte Tracking und Fusion. Ergebnis gespeichert in \{OUTPUT_FILE\}")\
+    \
+    # Parameter f\'fcr die 2D-Draufsicht (Karte)\
+    MAP_SIZE = frame_width\
+    MAP_SCALE = 5                  \
+    MAP_CENTER_X = MAP_SIZE // 2\
+    MAP_CENTER_Y = MAP_HEIGHT // 2\
+    \
+    axis_points_3d = get_axis_points(MARKER_SIDE_LENGTH)\
+\
+    while cap.isOpened():\
+        ret, frame = cap.read()\
+        if not ret:\
+            break\
+            \
+        frame_visual = frame.copy()\
+        map_image = np.zeros((MAP_SIZE // 2, MAP_SIZE, 3), dtype=np.uint8)\
+        map_image.fill(30) \
+        \
+        corners, ids, rejected = cv2.aruco.detectMarkers(frame, DICTIONARY, parameters=parameters)\
+\
+        if ids is not None and len(ids) >= 2: \
+            \
+            obj_points, img_points = get_obj_and_img_points(corners, ids, marker_data, BASE_CORNERS)\
+            \
+            if len(obj_points) >= 8:\
+                \
+                # Berechnung der ROHE Pose (World_T_Camera)\
+                retval, rvec_raw, tvec_raw = cv2.solvePnP(\
+                    obj_points, img_points, cameraMatrix, distCoeffs\
+                )\
+                \
+                if retval: \
+                    \
+                    # 1. Gl\'e4ttung der Pose f\'fcr den Pfad\
+                    H_raw = pose_to_matrix(rvec_raw, tvec_raw)\
+                    if H_smooth is None:\
+                        H_smooth = H_raw\
+                    else:\
+                        H_smooth = (SMOOTHING_ALPHA * H_smooth) + ((1.0 - SMOOTHING_ALPHA) * H_raw)\
+                    \
+                    tvec_smooth = H_smooth[:3, 3]\
+                    rvec_smooth = cv2.Rodrigues(H_smooth[:3, :3])[0]\
+                    R_smooth = H_smooth[:3, :3]\
+                    \
+                    x = tvec_smooth[0]\
+                    y = tvec_smooth[1]\
+                    z = tvec_smooth[2]\
+                    \
+                    # 2. Visualisierung in der Kamera-Ansicht\
+                    \
+                    # Achsen auf ALLEN Markern zeichnen (an der Ecke)\
+                    rvecs_single, tvecs_single, _ = cv2.aruco.estimatePoseSingleMarkers(\
+                        corners, MARKER_SIDE_LENGTH, cameraMatrix, distCoeffs\
+                    )\
+\
+                    for i in range(len(ids)):\
+                        rvec_i = rvecs_single[i]\
+                        tvec_i = tvecs_single[i]\
+                        \
+                        # Projiziere die 3D-Achsenpunkte (die an der Ecke beginnen) in 2D\
+                        img_points_axis, _ = cv2.projectPoints(axis_points_3d, rvec_i, tvec_i, cameraMatrix, distCoeffs)\
+                        img_points_axis = np.int32(img_points_axis).reshape(-1, 2)\
+                        \
+                        # Zeichne die Achsen: Rot (X), Gr\'fcn (Y), Blau (Z)\
+                        p_origin = tuple(img_points_axis[0])\
+                        p_x = tuple(img_points_axis[1])\
+                        p_y = tuple(img_points_axis[2])\
+                        p_z = tuple(img_points_axis[3])\
+                        \
+                        cv2.line(frame_visual, p_origin, p_x, (0, 0, 255), 3)  # Rote X-Achse\
+                        cv2.line(frame_visual, p_origin, p_y, (0, 255, 0), 3)  # Gr\'fcne Y-Achse\
+                        cv2.line(frame_visual, p_origin, p_z, (255, 0, 0), 3)  # Blaue Z-Achse\
+                    \
+                    \
+                    # Text und Rote Punkte (ROHE Pose)\
+                    text = f"GLATTER PFAD Pos (cm): X=\{x:.2f\} Y=\{y:.2f\} Z=\{z:.2f\}"\
+                    cv2.putText(frame_visual, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)\
+                    \
+                    # Pfadverfolgung (Der glatte Graph im ORIGINAL-FRAME)\
+                    CAMERA_PATH.append(np.array([x, y, 0.0], dtype=np.float32))\
+                    \
+                    if len(CAMERA_PATH) > 1:\
+                        path_points_3d = np.array(CAMERA_PATH).reshape(-1, 3)\
+                        path_points_2d, _ = cv2.projectPoints(\
+                            path_points_3d, rvec_raw, tvec_raw, cameraMatrix, distCoeffs\
+                        )\
+                        path_points_2d = np.int32(path_points_2d).reshape(-1, 2)\
+                        \
+                        # ACHTUNG: Die pinke Spur im Video wurde HIER entfernt.\
+                            \
+                    # Marker-Mittelpunkte als ROTE PUNKTE (ROHE Pose)\
+                    marker_centers_3d = np.array([marker_data[ID_A], marker_data[ID_B], marker_data[ID_C]], dtype=np.float32)\
+                    centers_2d, _ = cv2.projectPoints(\
+                        marker_centers_3d, rvec_raw, tvec_raw, cameraMatrix, distCoeffs\
+                    )\
+                    for center in centers_2d.reshape(-1, 2):\
+                        cv2.circle(frame_visual, (int(center[0]), int(center[1])), 5, (0, 0, 255), -1) \
+                        \
+                    # 3. Visualisierung in der 2D-Draufsicht (Karte)\
+                    \
+                    # ZEICHNE MARKER ALS FESTE BLAUE PUNKTE (wie im Screenshot)\
+                    for pos in marker_data.values():\
+                        map_x = int(MAP_CENTER_X + pos[0] * MAP_SCALE)\
+                        map_y = int(MAP_CENTER_Y - pos[1] * MAP_SCALE) \
+                        cv2.circle(map_image, (map_x, map_y), 5, (255, 0, 0), -1) # Blau\
+                        \
+                    # Zeichne den Pfad in der Draufsicht (GR\'dcNER PFAD)\
+                    path_points_2d_map = []\
+                    for pos in CAMERA_PATH:\
+                        map_x = int(MAP_CENTER_X + pos[0] * MAP_SCALE)\
+                        map_y = int(MAP_CENTER_Y - pos[1] * MAP_SCALE)\
+                        path_points_2d_map.append((map_x, map_y))\
+                        \
+                    if len(path_points_2d_map) > 1:\
+                        for i in range(1, len(path_points_2d_map)):\
+                            cv2.line(map_image, path_points_2d_map[i-1], path_points_2d_map[i], (0, 255, 0), 2) # Gr\'fcn\
+                        \
+                    # Zeichne die aktuelle Kameraposition (Wei\'dfer Punkt)\
+                    current_pos_map = path_points_2d_map[-1]\
+                    cv2.circle(map_image, current_pos_map, 4, (255, 255, 255), -1) \
+\
+        # 4. Endg\'fcltige Fusion und Anzeige\
+        \
+        if frame_visual.shape[1] != map_image.shape[1]:\
+            map_image = cv2.resize(map_image, (frame_width, MAP_HEIGHT))\
+            \
+        # Kombiniere die Karte oben und das Video unten (wie im Screenshot)\
+        combined_frame = np.vstack((map_image, frame_visual))\
+        \
+        # Speichern und Anzeigen\
+        out.write(combined_frame) \
+        cv2.imshow('Kombinierte Ansicht (Map + Video)', combined_frame)\
+\
+\
+        if cv2.waitKey(1) & 0xFF == ord('q'):\
+            break\
+\
+    cap.release()\
+    out.release()  \
+    cv2.destroyAllWindows()\
+    print(f"Video-Verarbeitung beendet. Ergebnis gespeichert in \{OUTPUT_FILE\}")\
+\
+if __name__ == "__main__":\
+    process_video()}
